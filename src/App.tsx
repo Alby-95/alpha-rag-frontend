@@ -1,10 +1,13 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import banner from "./assets/alpha-banner.png";
+import { fetchConversations, createConversation } from "./api/conversationApi";
+import { fetchMessages, sendMessage } from "./api/messageApi";
 
 type Conversation = {
     id: string;
     title: string;
-    updatedAt: string;
+    createdAt?: string;
+    updatedAt?: string;
 };
 
 type Message = {
@@ -17,101 +20,128 @@ function clsx(...v: Array<string | false | null | undefined>) {
     return v.filter(Boolean).join(" ");
 }
 
-function makeId(prefix: string) {
-    return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-}
-
-const seedConversations: Conversation[] = [
-    { id: "c1", title: "RAG 설계", updatedAt: "방금" },
-    { id: "c2", title: "Spring 구조", updatedAt: "오늘" },
-    { id: "c3", title: "면접 준비", updatedAt: "어제" },
-];
-
-// c1만 메시지 넣고, c2/c3는 비워서 Empty state가 보이게 해둠
-const seedMessageMap: Record<string, Message[]> = {
-    c1: [
-        { id: "m1", role: "assistant", content: "안녕하세요! 무엇을 도와드릴까요?" },
-        { id: "m2", role: "user", content: "뤼튼 같은 UI 먼저 만들고 싶어." },
-        {
-            id: "m3",
-            role: "assistant",
-            content: "좋아요. 사이드바/채팅/입력창부터 잡아볼게요.",
-        },
-    ],
-    c2: [],
-    c3: [],
-};
-
 const promptPresets = [
     "RAG 설계(테이블/인덱스) 뼈대 잡아줘",
     "Spring Boot API 설계부터 같이 정리하자",
     "FastAPI RAG 엔드포인트 예시 코드 만들어줘",
 ];
+function mapConversations(data: any): Conversation[] {
+    return (Array.isArray(data) ? data : []).map((c: any) => ({
+        id: String(c.id),
+        title: c.title ?? "대화",
+        createdAt: c.createdAt ?? c.created_at,
+        updatedAt: "방금",
+    }));
+}
+
+function mapMessages(data: any): Message[] {
+    return (Array.isArray(data) ? data : []).map((m: any) => ({
+        id: String(m.id),
+        role:
+            String(m.role).toUpperCase() === "USER" || String(m.role).toLowerCase() === "user"
+                ? "user"
+                : "assistant",
+        content: m.content ?? "",
+    }));
+}
+
 
 export default function App() {
-    const [activeId, setActiveId] = useState(seedConversations[0].id);
+    const [activeId, setActiveId] = useState<string>("");
     const [ragDebug, setRagDebug] = useState(true);
 
-    const [conversations, setConversations] = useState<Conversation[]>(seedConversations);
-    const [messageMap, setMessageMap] = useState<Record<string, Message[]>>(seedMessageMap);
-
-    const activeMessages = messageMap[activeId] ?? [];
+    const [conversations, setConversations] = useState<Conversation[]>([]);
+    const [messageMap, setMessageMap] = useState<Record<string, Message[]>>({});
 
     const [draft, setDraft] = useState("");
     const [isSending, setIsSending] = useState(false);
 
-    function pushMessage(conversationId: string, msg: Message) {
-        setMessageMap((prev) => {
-            const next = { ...prev };
-            next[conversationId] = [...(next[conversationId] ?? []), msg];
-            return next;
-        });
-    }
+    const activeMessages = messageMap[activeId] ?? [];
 
-    function handleSend(text?: string) {
+    // 1) 대화 목록 로드
+    useEffect(() => {
+        fetchConversations()
+            .then((data) => {
+                const list = mapConversations(data);
+                console.log("대화목록 API:", list);
+                if (list.length > 0) {
+                    setConversations(list);
+                    setActiveId(list[0].id);
+                }
+            })
+            .catch((err) => console.error("대화목록 API 에러:", err));
+    }, []);
+
+    // 2) activeId 바뀌면 메시지 로드
+    useEffect(() => {
+        if (!activeId) return;
+
+        console.log("[activeId 변경] 메시지 불러오기:", activeId);
+
+        fetchMessages(activeId)
+            .then((data) => {
+                console.log("[GET messages 응답]", data);
+
+                const list = (Array.isArray(data) ? data : []).map((m: any) => ({
+                    id: String(m.id),
+                    role:
+                        String(m.role).toUpperCase() === "USER" || String(m.role).toLowerCase() === "user"
+                            ? "user"
+                            : "assistant",
+                    content: m.content ?? "",
+                })) as Message[];
+
+                setMessageMap((prev) => ({ ...prev, [activeId]: list }));
+                console.log("[렌더용 메시지 list]", list);
+            })
+            .catch((err) => console.error("[GET messages 실패]", err));
+    }, [activeId]);
+
+    async function handleNewConversation() {
+        try {
+            // 1) 서버에 대화 생성
+            await createConversation("새 대화");
+
+            // 2) 대화 목록 다시 불러오기
+            const list = await fetchConversations();
+
+            // 3) 목록 갱신 + 가장 최근 대화로 이동(보통 첫 번째)
+            if (list.length > 0) {
+                setConversations(list);
+                setActiveId(list[0].id);
+
+                // 메시지 맵에 없으면 빈 배열로 준비 (UI 깨짐 방지)
+                setMessageMap((prev) => ({ ...prev, [list[0].id]: prev[list[0].id] ?? [] }));
+            }
+        } catch (e) {
+            console.error("새 대화 생성 실패:", e);
+            alert("새 대화 생성 실패! (콘솔 확인)");
+        }
+    }
+    async function handleSend(text?: string) {
         const content = (text ?? draft).trim();
         if (!content || isSending) return;
 
-        setIsSending(true);
+        // 서버 대화 id일 때만 전송 (seed 대화는 임시)
+        const isServerId = /^\d+$/.test(activeId);
+        if (!isServerId) {
+            alert("서버에 저장하려면 '+ 새 대화'로 만든 대화(서버 id)에서 전송하세요.");
+            return;
+        }
 
-        const userMsg: Message = { id: makeId("u"), role: "user", content };
-        pushMessage(activeId, userMsg);
+        setIsSending(true);
         setDraft("");
 
-        // TODO: 다음 단계에서 Spring API 호출로 교체
-        window.setTimeout(() => {
-            const botMsg: Message = {
-                id: makeId("a"),
-                role: "assistant",
-                content: "좋아요. 다음 단계에서 Spring API 붙여서 실제로 저장/응답 처리할게요.",
-            };
-            pushMessage(activeId, botMsg);
+        try {
+            const data = await sendMessage(activeId, content);
+            const list = mapMessages(data);
+            setMessageMap((prev) => ({ ...prev, [activeId]: list }));
+        } catch (e) {
+            console.error("메시지 전송 실패:", e);
+            alert("메시지 전송 실패 (콘솔 확인)");
+        } finally {
             setIsSending(false);
-        }, 650);
-    }
-    function handleNewConversation() {
-        const newId = makeId("c");
-
-        const newConv: Conversation = {
-            id: newId,
-            title: "새 대화",
-            updatedAt: "방금",
-        };
-
-        // 목록 맨 위에 추가
-        setConversations((prev) => [newConv, ...prev]);
-
-        // 메시지 목록 초기화
-        setMessageMap((prev) => ({ ...prev, [newId]: [] }));
-
-        // 새 대화로 이동
-        setActiveId(newId);
-
-        // 입력창 포커스는 조금 있다가 (렌더 끝난 후)
-        window.setTimeout(() => {
-            const el = document.querySelector<HTMLTextAreaElement>(".composer__input");
-            el?.focus();
-        }, 0);
+        }
     }
     function handleDeleteConversation(id: string) {
         if (!window.confirm("이 대화를 삭제할까요?")) return;
